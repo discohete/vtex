@@ -8,7 +8,7 @@ import os   # For clearing screen
 
 # Configure Gemini
 # !!! REPLACE WITH YOUR ACTUAL GEMINI API KEY !!!
-genai.configure(api_key="AIzaSyDAVrID_SyPyG2O104gKweG2kO8EE_pFUE")
+genai.configure(api_key="")
 
 generation_config = {
     "temperature": 0.25,  # Basado en el slider que muestra 0,25
@@ -31,8 +31,8 @@ VTEX_ENV = "vtexcommercestable"
 BASE_URL = f"https://{VTEX_ACCOUNT}.{VTEX_ENV}.com.br"
 # !!! REPLACE WITH YOUR ACTUAL VTEX CREDENTIALS !!!
 HEADERS = {
-    "X-VTEX-API-AppKey": "vtexappkey-tiendasdigitalesar-HLCOFP",
-    "X-VTEX-API-AppToken": "LOWGDISZQKWZKJJWEWZYTISXHKDZOKCWQGJYIZARNQEERGANQGGRNAZQBBLCBHMUESXBKZZELMSJZWVPVNAPWMDSLUIPPKMFCPSQHEOSYHWTNZMIBLMCHRKSZGDNAPCS",
+    "X-VTEX-API-AppKey": "",
+    "X-VTEX-API-AppToken": "LCS",
     "Content-Type": "application/json",
     "Accept": "application/json"
 }
