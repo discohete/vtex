@@ -1,0 +1,1537 @@
+import requests
+import google.generativeai as genai
+import time
+import json # For robust JSON parsing
+import re   # For regex-based JSON extraction
+from bs4 import BeautifulSoup # For HTML cleaning
+import os   # For clearing screen
+
+# Configure Gemini
+# !!! REPLACE WITH YOUR ACTUAL GEMINI API KEY !!!
+genai.configure(api_key="AIzaSyDAVrID_SyPyG2O104gKweG2kO8EE_pFUE")
+
+generation_config = {
+    "temperature": 0.25,  # Basado en el slider que muestra 0,25
+    "top_p": 0.95,        # Basado en el slider que muestra 0,95
+    "top_k": 40,          # Valor por defecto (no visible en la UI)
+    "max_output_tokens": 8192,  # Basado en "Output length: 8192"
+    "response_mime_type": "text/plain",  # Sin structured output activado
+}
+
+model = genai.GenerativeModel(
+    model_name="gemini-2.0-flash-exp",  # Equivalente a "Gemini 2.0 Flash-Lite"
+    generation_config=generation_config,
+    # Las herramientas (Function calling) están desactivadas según la imagen
+    tools=None,
+)
+
+# VTEX API Configuration
+VTEX_ACCOUNT = "tiendasdigitalesar"
+VTEX_ENV = "vtexcommercestable"
+BASE_URL = f"https://{VTEX_ACCOUNT}.{VTEX_ENV}.com.br"
+# !!! REPLACE WITH YOUR ACTUAL VTEX CREDENTIALS !!!
+HEADERS = {
+    "X-VTEX-API-AppKey": "vtexappkey-tiendasdigitalesar-HLCOFP",
+    "X-VTEX-API-AppToken": "LOWGDISZQKWZKJJWEWZYTISXHKDZOKCWQGJYIZARNQEERGANQGGRNAZQBBLCBHMUESXBKZZELMSJZWVPVNAPWMDSLUIPPKMFCPSQHEOSYHWTNZMIBLMCHRKSZGDNAPCS",
+    "Content-Type": "application/json",
+    "Accept": "application/json"
+}
+
+REQUEST_TIMEOUT = 25
+
+def clean_html(raw_html):
+    if not raw_html: return ""
+    return BeautifulSoup(raw_html, "html.parser").get_text(separator=' ', strip=True)
+
+def get_product_data(product_id):
+    url = f"{BASE_URL}/api/catalog/pvt/product/{product_id}"
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+        return {"Description": data.get("Description"), "CategoryId": data.get("CategoryId"), "Name": data.get("Name")}
+    except requests.exceptions.RequestException as e:
+        print(f"Error al obtener datos del producto {product_id}: {e}")
+    except json.JSONDecodeError as e:
+        print(f"Error al decodificar JSON del producto {product_id}: {e} - Respuesta: {response.text}")
+    return None
+
+def get_category_fields(category_id):
+    url = f"{BASE_URL}/api/catalog_system/pub/specification/field/listByCategoryId/{category_id}"
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        fields = response.json()
+        if not isinstance(fields, list):
+            print(f"Advertencia: La respuesta de campos de categoría para CatID {category_id} no es una lista: {fields}")
+            return []
+        return fields
+    except requests.exceptions.RequestException as e:
+        print(f"Error al obtener campos de categoría para CatID {category_id}: {e}")
+    except json.JSONDecodeError as e:
+        print(f"Error al decodificar JSON de campos de categoría (CatID {category_id}): {e} - Respuesta: {response.text}")
+    return None
+
+def process_with_gemini(product_name, description, category_fields_list_vtex):
+    if not description:
+        print("Descripción del producto vacía. Omitiendo procesamiento con Gemini.")
+        return {}
+
+    vtex_field_names_for_prompt = [f.get("Name") for f in category_fields_list_vtex if f.get("Name")]
+    if not vtex_field_names_for_prompt:
+        print("No se encontraron nombres de campos de categoría para el prompt. Omitiendo Gemini.")
+        return {}
+    fields_str = "\n".join([f"- \"{name}\"" for name in vtex_field_names_for_prompt])
+
+    prompt = f"""
+    Eres un sistema experto en extracción de información de productos.
+    Tu tarea es analizar la información del producto y extraer valores para los campos de especificación predefinidos.
+    TODOS los valores extraídos serán tratados como TEXTO para campos de entrada de texto libre.
+
+    Nombre del Producto: {product_name}
+    Descripción del Producto:
+    {description}
+
+    Campos de especificación disponibles (los nombres de las claves en tu JSON DEBEN COINCIDIR EXACTAMENTE con estos nombres, incluyendo mayúsculas/minúsculas y acentos):
+    {fields_str}
+
+    Instrucciones:
+    1. Lee cuidadosamente el nombre y la descripción del producto, traducela al español si es necesario.
+    2. Para cada campo de especificación disponible, intenta encontrar la información correspondiente.
+    3. Si se encuentra información para un campo, inclúyelo en la salida JSON. El valor debe ser una cadena de texto.
+    4. Si NO se encuentra información para un campo, o si es ambigua, OMITE el campo de la salida JSON. No adivines ni inventes valores.
+    5. Devuelve ÚNICAMENTE un objeto JSON válido. Las claves DEBEN SER LOS NOMBRES DE CAMPO exactos proporcionados arriba.
+    6. Asegúrate de que los valores sean concisos y extraídos directamente, si estan en ingles, ponlos en español.
+
+    Ejemplo de formato de salida JSON deseado (las claves DEBEN ser las que se te dieron en "Campos de especificación disponibles"):
+    {{
+        "Socket": "AM4",
+        "Núcleos / Hilos": "6 / 12"
+    }}
+    """
+    try:
+        response = model.generate_content(prompt)
+        raw_text = response.text.strip()
+        try:
+            return json.loads(raw_text)
+        except json.JSONDecodeError:
+            match = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", raw_text, re.DOTALL) or \
+                    re.search(r"(\{[\s\S]*?\})", raw_text, re.DOTALL)
+            if match: return json.loads(match.group(1))
+            print(f"No se pudo extraer JSON de la respuesta de Gemini: {raw_text}")
+    except Exception as e:
+        print(f"Error con la API de Gemini o procesamiento: {e}")
+    return None
+
+# =====================================================
+# FUNCIONES PARA ACTUALIZAR ESPECIFICACIONES EN VTEX
+# =====================================================
+
+def get_current_specifications(product_id):
+    """Obtiene las especificaciones actuales del producto"""
+    url = f"{BASE_URL}/api/catalog/pvt/product/{product_id}/specification"
+    
+    try:
+        print(f"📡 Obteniendo especificaciones actuales del producto {product_id}...")
+        response = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        specs = response.json()
+        print(f"✅ Se obtuvieron {len(specs) if specs else 0} especificaciones actuales")
+        return specs if isinstance(specs, list) else []
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Error al obtener especificaciones actuales: {e}")
+        return []
+    except json.JSONDecodeError as e:
+        print(f"❌ Error al decodificar JSON de especificaciones: {e}")
+        return []
+
+def find_existing_specification(specs_list, field_id):
+    """Busca si ya existe una especificación para el field_id dado"""
+    if not specs_list:
+        return None
+    
+    for spec in specs_list:
+        if spec.get('FieldId') == field_id:
+            return spec
+    return None
+
+def find_field_by_name(category_fields, field_name):
+    """Encuentra un campo de categoría por nombre exacto"""
+    for field in category_fields:
+        if field.get('Name') == field_name:
+            return field
+    return None
+
+def check_field_type(field_info):
+    """Determina si un campo requiere FieldValueId o acepta texto libre"""
+    # Los campos con IsRequired=True para FieldValueId suelen ser dropdowns
+    # También podemos verificar si tiene DefaultValue o otros indicadores
+    field_type_id = field_info.get('FieldTypeId')
+    
+    # FieldTypeId 1 = Texto, 4 = Número, 5 = Combo (dropdown), etc.
+    if field_type_id == 5:  # Combo/Dropdown
+        return "dropdown"
+    elif field_type_id in [1, 4, 6, 7, 8]:  # Texto, Número, etc.
+        return "text"
+    else:
+        # Por defecto asumir texto libre, pero mostrar advertencia
+        print(f"⚠️ Tipo de campo desconocido (FieldTypeId: {field_type_id}), asumiendo texto libre")
+        return "text"
+
+def delete_and_recreate_specification(spec_id, product_id, field_id, text_value):
+    """Elimina una especificación existente y la recrea con el nuevo valor"""
+    
+    # Paso 1: Eliminar especificación existente
+    delete_url = f"{BASE_URL}/api/catalog/pvt/product/{product_id}/specification/{spec_id}"
+    
+    try:
+        print(f"  🗑️ Eliminando especificación existente (ID: {spec_id})...")
+        delete_response = requests.delete(delete_url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        
+        if delete_response.status_code in [200, 204, 404]:  # 404 = ya no existe
+            print("  ✅ Eliminación exitosa")
+            
+            # Esperar un poco antes de recrear
+            time.sleep(1)
+            
+            # Paso 2: Recrear la especificación
+            create_url = f"{BASE_URL}/api/catalog/pvt/product/{product_id}/specification"
+            
+            create_data = {
+                "ProductId": int(product_id),
+                "FieldId": field_id,
+                "Text": text_value
+            }
+            
+            print(f"  🆕 Recreando especificación...")
+            create_response = requests.post(create_url, headers=HEADERS, json=create_data, timeout=REQUEST_TIMEOUT)
+            
+            if create_response.status_code in [200, 201]:
+                print("  🎉 ✅ Especificación recreada exitosamente!")
+                return True, create_response.json() if create_response.text else {}
+            else:
+                error_msg = create_response.text or f"Status {create_response.status_code}"
+                print(f"  ❌ Error al recrear especificación: {error_msg}")
+                return False, error_msg
+                
+        else:
+            error_msg = delete_response.text or f"Status {delete_response.status_code}"
+            print(f"  ❌ Error al eliminar especificación: {error_msg}")
+            return False, error_msg
+            
+    except requests.exceptions.RequestException as e:
+        print(f"  ❌ Error de conexión en delete/recreate: {e}")
+        return False, str(e)
+    except Exception as e:
+        print(f"  ❌ Error inesperado en delete/recreate: {e}")
+        return False, str(e)
+
+def create_new_specification(product_id, field_id, text_value):
+    """Crea una nueva especificación cuando no existe"""
+    url = f"{BASE_URL}/api/catalog/pvt/product/{product_id}/specification"
+    
+    data = {
+        "ProductId": int(product_id),
+        "FieldId": field_id,
+        "Text": text_value
+    }
+    
+    try:
+        print(f"  🆕 Creando nueva especificación...")
+        response = requests.post(url, headers=HEADERS, json=data, timeout=REQUEST_TIMEOUT)
+        
+        if response.status_code in [200, 201]:
+            print("  🎉 ✅ Nueva especificación creada exitosamente!")
+            return True, response.json() if response.text else {}
+        else:
+            error_msg = response.text or f"Status {response.status_code}"
+            print(f"  ❌ Error al crear especificación: {error_msg}")
+            return False, error_msg
+            
+    except requests.exceptions.RequestException as e:
+        print(f"  ❌ Error de conexión al crear especificación: {e}")
+        return False, str(e)
+    except Exception as e:
+        print(f"  ❌ Error inesperado al crear especificación: {e}")
+        return False, str(e)
+
+def update_product_specs_via_put(product_id, standardized_data, category_fields_vtex):
+    """
+    Actualiza las especificaciones del producto usando el método delete/recreate
+    que sabemos que funciona en VTEX.
+    
+    Args:
+        product_id: ID del producto en VTEX
+        standardized_data: Dict con {nombre_campo: valor} extraído por Gemini
+        category_fields_vtex: Lista de campos disponibles en la categoría
+    
+    Returns:
+        bool: True si todas las actualizaciones fueron exitosas
+    """
+    
+    print(f"\n🔄 Iniciando actualización de especificaciones para producto {product_id}...")
+    
+    # Obtener especificaciones actuales
+    current_specs = get_current_specifications(product_id)
+    
+    success_count = 0
+    total_count = len(standardized_data)
+    results = []
+    
+    for field_name, new_value in standardized_data.items():
+        print(f"\n📝 Procesando campo: '{field_name}' → '{new_value}'")
+        
+        # Buscar el campo en la lista de campos de categoría
+        field_info = find_field_by_name(category_fields_vtex, field_name)
+        if not field_info:
+            print(f"  ❌ Campo '{field_name}' no encontrado en la categoría")
+            results.append({
+                "field_name": field_name,
+                "success": False,
+                "error": "Campo no encontrado en categoría"
+            })
+            continue
+        
+        field_id = field_info.get('FieldId')
+        if not field_id:
+            print(f"  ❌ FieldId no encontrado para campo '{field_name}'")
+            results.append({
+                "field_name": field_name,
+                "success": False,
+                "error": "FieldId no disponible"
+            })
+            continue
+        
+        print(f"  📋 Campo encontrado - FieldId: {field_id}")
+        
+        # Verificar el tipo de campo
+        field_type = check_field_type(field_info)
+        if field_type == "dropdown":
+            print(f"  ⚠️ ADVERTENCIA: Campo '{field_name}' parece ser dropdown.")
+            print(f"     Si falla, puede requerir FieldValueId en lugar de texto libre.")
+        
+        # Buscar si ya existe la especificación
+        existing_spec = find_existing_specification(current_specs, field_id)
+        
+        if existing_spec:
+            spec_id = existing_spec.get('Id')
+            current_value = existing_spec.get('Text', '')
+            print(f"  📄 Especificación existe - ID: {spec_id}, Valor actual: '{current_value}'")
+            
+            if current_value == new_value:
+                print(f"  ⏭️ Valor ya es correcto, omitiendo...")
+                success_count += 1
+                results.append({
+                    "field_name": field_name,
+                    "success": True,
+                    "action": "skipped",
+                    "message": "Valor ya correcto"
+                })
+                continue
+            
+            # Actualizar usando delete/recreate
+            success, response_data = delete_and_recreate_specification(
+                spec_id, product_id, field_id, new_value
+            )
+            
+            if success:
+                success_count += 1
+                results.append({
+                    "field_name": field_name,
+                    "success": True,
+                    "action": "updated",
+                    "response": response_data
+                })
+            else:
+                results.append({
+                    "field_name": field_name,
+                    "success": False,
+                    "error": response_data,
+                    "action": "failed_update"
+                })
+        else:
+            print(f"  📝 Especificación no existe, creando nueva...")
+            
+            # Crear nueva especificación
+            success, response_data = create_new_specification(product_id, field_id, new_value)
+            
+            if success:
+                success_count += 1
+                results.append({
+                    "field_name": field_name,
+                    "success": True,
+                    "action": "created",
+                    "response": response_data
+                })
+            else:
+                results.append({
+                    "field_name": field_name,
+                    "success": False,
+                    "error": response_data,
+                    "action": "failed_create"
+                })
+        
+        # Pausa entre operaciones para no sobrecargar la API
+        time.sleep(1)
+    
+    # Mostrar resumen de resultados
+    print(f"\n📊 RESUMEN DE ACTUALIZACIÓN - Producto {product_id}")
+    print(f"{'='*60}")
+    
+    for result in results:
+        field_name = result["field_name"]
+        if result["success"]:
+            action = result.get("action", "unknown")
+            print(f"✅ {field_name:<25} | {action}")
+        else:
+            error = result.get("error", "Error desconocido")
+            action = result.get("action", "unknown")
+            print(f"❌ {field_name:<25} | {action} - {error}")
+    
+    print(f"{'='*60}")
+    print(f"🎯 RESULTADO FINAL: {success_count}/{total_count} especificaciones procesadas exitosamente")
+    
+    if success_count == total_count:
+        print("🎉 ¡TODAS LAS ESPECIFICACIONES SE ACTUALIZARON CORRECTAMENTE!")
+        return True
+    else:
+        print("⚠️ Algunas especificaciones no se pudieron actualizar.")
+        return False
+
+# =====================================================
+# FUNCIONES PARA GESTIONAR PRODUCTOS EN VTEX
+# =====================================================
+
+def get_brand_list():
+    """Obtiene la lista completa de marcas en VTEX"""
+    url = f"{BASE_URL}/api/catalog_system/pvt/brand/list"
+    
+    try:
+        print(f"📡 Obteniendo lista de marcas...")
+        response = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        brands = response.json()
+        print(f"✅ Se obtuvieron {len(brands) if brands else 0} marcas")
+        return brands if isinstance(brands, list) else []
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Error al obtener lista de marcas: {e}")
+        return []
+    except json.JSONDecodeError as e:
+        print(f"❌ Error al decodificar JSON de marcas: {e}")
+        return []
+
+def get_category_tree(levels=10):
+    """Obtiene el árbol de categorías de VTEX"""
+    url = f"{BASE_URL}/api/catalog_system/pub/category/tree/{levels}"
+    
+    try:
+        print(f"📡 Obteniendo árbol de categorías (niveles: {levels})...")
+        response = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        categories = response.json()
+        print(f"✅ Se obtuvo el árbol de categorías")
+        return categories if isinstance(categories, list) else []
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Error al obtener árbol de categorías: {e}")
+        return []
+    except json.JSONDecodeError as e:
+        print(f"❌ Error al decodificar JSON de categorías: {e}")
+        return []
+
+def create_brand(brand_data):
+    """Crea una nueva marca en VTEX"""
+    url = f"{BASE_URL}/api/catalog/pvt/brand"
+    
+    try:
+        print(f"🆕 Creando nueva marca: '{brand_data.get('Name')}'...")
+        response = requests.post(url, headers=HEADERS, json=brand_data, timeout=REQUEST_TIMEOUT)
+        
+        if response.status_code in [200, 201]:
+            print(f"🎉 ✅ Marca creada exitosamente!")
+            return True, response.json() if response.text else {}
+        else:
+            error_msg = response.text or f"Status {response.status_code}"
+            print(f"❌ Error al crear marca: {error_msg}")
+            return False, error_msg
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Error de conexión al crear marca: {e}")
+        return False, str(e)
+    except Exception as e:
+        print(f"❌ Error inesperado al crear marca: {e}")
+        return False, str(e)
+
+def create_category(category_data):
+    """Crea una nueva categoría en VTEX"""
+    url = f"{BASE_URL}/api/catalog/pvt/category"
+    
+    try:
+        print(f"🆕 Creando nueva categoría: '{category_data.get('Name')}'...")
+        response = requests.post(url, headers=HEADERS, json=category_data, timeout=REQUEST_TIMEOUT)
+        
+        if response.status_code in [200, 201]:
+            print(f"🎉 ✅ Categoría creada exitosamente!")
+            return True, response.json() if response.text else {}
+        else:
+            error_msg = response.text or f"Status {response.status_code}"
+            print(f"❌ Error al crear categoría: {error_msg}")
+            return False, error_msg
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Error de conexión al crear categoría: {e}")
+        return False, str(e)
+    except Exception as e:
+        print(f"❌ Error inesperado al crear categoría: {e}")
+        return False, str(e)
+
+def create_product(product_data):
+    """Crea un nuevo producto en VTEX"""
+    url = f"{BASE_URL}/api/catalog/pvt/product"
+    
+    try:
+        print(f"🆕 Creando nuevo producto: '{product_data.get('Name')}'...")
+        response = requests.post(url, headers=HEADERS, json=product_data, timeout=REQUEST_TIMEOUT)
+        
+        if response.status_code in [200, 201]:
+            print(f"🎉 ✅ Producto creado exitosamente!")
+            return True, response.json() if response.text else {}
+        else:
+            error_msg = response.text or f"Status {response.status_code}"
+            print(f"❌ Error al crear producto: {error_msg}")
+            return False, error_msg
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Error de conexión al crear producto: {e}")
+        return False, str(e)
+    except Exception as e:
+        print(f"❌ Error inesperado al crear producto: {e}")
+        return False, str(e)
+
+def get_product_by_ref_id(ref_id):
+    """Obtiene información de un producto VTEX por Ref ID"""
+    url = f"{BASE_URL}/api/catalog/pvt/product/productgetbyrefid/{ref_id}"
+    
+    try:
+        print(f"📡 Buscando producto con RefID: {ref_id}...")
+        response = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+        print(f"✅ Producto encontrado: ID {data.get('Id')}, Nombre: {data.get('Name')}")
+        return data
+    except requests.exceptions.RequestException as e:
+        if hasattr(e, 'response') and e.response and e.response.status_code == 404:
+            print(f"ℹ️ No se encontró producto con RefID: {ref_id}")
+            return None
+        print(f"❌ Error al buscar producto con RefID {ref_id}: {e}")
+        return None
+    except json.JSONDecodeError as e:
+        print(f"❌ Error al decodificar JSON del producto con RefID {ref_id}: {e}")
+        return None
+
+def update_product_description(product_id, description):
+    """Actualiza la descripción de un producto existente"""
+    # Primero obtenemos los datos actuales del producto
+    url = f"{BASE_URL}/api/catalog/pvt/product/{product_id}"
+    
+    try:
+        print(f"📡 Obteniendo datos actuales del producto {product_id}...")
+        get_response = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        get_response.raise_for_status()
+        product_data = get_response.json()
+        
+        # Actualizamos solo la descripción
+        product_data['Description'] = description
+        
+        print(f"🔄 Actualizando descripción del producto {product_id}...")
+        update_response = requests.put(url, headers=HEADERS, json=product_data, timeout=REQUEST_TIMEOUT)
+        
+        if update_response.status_code in [200, 204]:
+            print(f"🎉 ✅ Descripción actualizada exitosamente!")
+            return True, update_response.json() if update_response.text else {}
+        else:
+            error_msg = update_response.text or f"Status {update_response.status_code}"
+            print(f"❌ Error al actualizar descripción: {error_msg}")
+            return False, error_msg
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Error de conexión al actualizar descripción: {e}")
+        return False, str(e)
+    except json.JSONDecodeError as e:
+        print(f"❌ Error al decodificar JSON: {e}")
+        return False, str(e)
+    except Exception as e:
+        print(f"❌ Error inesperado: {e}")
+        return False, str(e)
+
+def analyze_product_info_with_gemini(ref_id, title, brands_list, categories_tree):
+    """Analiza el RefID y título del producto para sugerir marca y categoría"""
+    
+    # Preparar datos de marcas para el prompt
+    brands_str = "\n".join([f"- ID: {b.get('Id')}, Nombre: \"{b.get('Name')}\"" for b in brands_list[:100]])
+    
+    # Función recursiva para aplanar el árbol de categorías
+    def flatten_categories(categories, prefix=""):
+        result = []
+        for cat in categories:
+            cat_name = f"{prefix}{cat.get('name')}"
+            result.append(f"- ID: {cat.get('id')}, Nombre: \"{cat_name}\"")
+            if cat.get('children'):
+                result.extend(flatten_categories(cat.get('children'), prefix=f"{cat_name} > "))
+        return result
+    
+    # Aplanar categorías para el prompt
+    categories_str = "\n".join(flatten_categories(categories_tree)[:100])
+    
+    prompt = f"""
+    Eres un sistema experto en análisis de productos para e-commerce.
+    
+    Analiza el siguiente producto:
+    - RefID: {ref_id}
+    - Título: {title}
+    
+    Tu tarea es identificar la marca y categoría más adecuada para este producto.
+    
+    MARCAS DISPONIBLES (primeras 100):
+    {brands_str}
+    
+    CATEGORÍAS DISPONIBLES (primeras 100):
+    {categories_str}
+    
+    Instrucciones:
+    1. Analiza el RefID y título del producto.
+    2. Identifica la marca más adecuada de la lista proporcionada.
+    3. Identifica la categoría más adecuada del árbol proporcionado.
+    4. Si no encuentras una coincidencia exacta para la marca, sugiere la más cercana o indica que se debe crear una nueva.
+    5. Si no encuentras una coincidencia exacta para la categoría, sugiere la más cercana.
+    
+    Devuelve ÚNICAMENTE un objeto JSON con el siguiente formato:
+    {{
+        "brand": {{
+            "id": 123,  // ID de la marca encontrada, o null si no se encontró
+            "name": "Nombre de la marca encontrada",
+            "create_new": true/false,  // Si se debe crear una nueva marca
+            "confidence": 0.95  // Nivel de confianza de 0 a 1
+        }},
+        "category": {{
+            "id": 456,  // ID de la categoría encontrada, o null si no se encontró
+            "name": "Nombre de la categoría encontrada",
+            "confidence": 0.85  // Nivel de confianza de 0 a 1
+        }}
+    }}
+    """
+    
+    try:
+        print(f"🧠 Analizando producto con Gemini...")
+        response = model.generate_content(prompt)
+        raw_text = response.text.strip()
+        
+        try:
+            return json.loads(raw_text)
+        except json.JSONDecodeError:
+            match = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", raw_text, re.DOTALL) or \
+                    re.search(r"(\{[\s\S]*?\})", raw_text, re.DOTALL)
+            if match: 
+                return json.loads(match.group(1))
+            print(f"No se pudo extraer JSON de la respuesta de Gemini: {raw_text}")
+    except Exception as e:
+        print(f"❌ Error con la API de Gemini o procesamiento: {e}")
+    
+    return None
+
+def generate_description_with_gemini(product_name, source_text):
+    """Genera una descripción estructurada para un producto a partir de texto fuente"""
+    
+    prompt = f"""
+    Eres un experto en redacción de descripciones de productos para e-commerce.
+    
+    Producto: {product_name}
+    
+    Texto fuente (de la página oficial u otra fuente):
+    {source_text}
+    
+    Tu tarea es crear una descripción de producto estructurada y atractiva para VTEX.
+    
+    Instrucciones:
+    1. Genera una descripción comercial breve y atractiva.
+    2. Luego, lista un resumen de especificaciones técnicas en formato de lista HTML.
+    3. Usa HTML básico para dar formato (párrafos <p>, listas <ul><li>, negritas <b>, etc.)
+    4. La descripción debe ser informativa, destacar beneficios y características clave.
+    5. Mantén un tono profesional pero accesible.
+    6. Asegúrate de que la información sea precisa según el texto fuente.
+    
+    Formato deseado:
+    <p><b>Descripción comercial breve</b></p>
+    <p>Texto descriptivo atractivo...</p>
+    
+    <p><b>Especificaciones:</b></p>
+    <ul>
+        <li><b>Característica 1:</b> Valor 1</li>
+        <li><b>Característica 2:</b> Valor 2</li>
+        ...
+    </ul>
+    
+    Devuelve ÚNICAMENTE el HTML de la descripción, sin comentarios adicionales.
+    """
+    
+    try:
+        print(f"🧠 Generando descripción con Gemini...")
+        # Configuración temporal para texto plano en lugar de JSON
+        temp_config = generation_config.copy()
+        temp_config["response_mime_type"] = "text/plain"
+        
+        temp_model = genai.GenerativeModel(
+            model_name="gemini-1.5-flash",
+            generation_config=temp_config,
+        )
+        
+        response = temp_model.generate_content(prompt)
+        description_html = response.text.strip()
+        
+        return description_html
+    except Exception as e:
+        print(f"❌ Error con la API de Gemini o procesamiento: {e}")
+        return None
+
+# =====================================================
+# FUNCIONES DE MENÚ Y PRINCIPAL
+# =====================================================
+
+def clear_screen():
+    """Limpia la pantalla de la consola"""
+    os.system('cls' if os.name == 'nt' else 'clear')
+
+def show_menu(title, options):
+    """Muestra un menú con opciones numeradas"""
+    clear_screen()
+    print(f"\n{'=' * 5} {title} {'=' * 5}")
+    for key, value in options.items():
+        print(f"{key}. {value}")
+    return input("\nSeleccione una opción: ").strip()
+
+def manage_specifications():
+    """Gestiona las opciones relacionadas con especificaciones"""
+    options = {
+        "1": "Actualizar especificaciones de producto(s)",
+        "2": "Analizar especificaciones de categoría",
+        "0": "Volver al menú principal"
+    }
+    
+    while True:
+        choice = show_menu("GESTIÓN DE ESPECIFICACIONES", options)
+        
+        if choice == "1":
+            update_product_specifications()
+        elif choice == "2":
+            print("\nFuncionalidad en desarrollo...")
+            input("\nPresione Enter para continuar...")
+        elif choice == "0":
+            break
+        else:
+            print("\nOpción no válida. Intente de nuevo.")
+            time.sleep(1)
+
+def update_product_specifications():
+    """Actualiza las especificaciones de uno o más productos"""
+    clear_screen()
+    print("\n===== ACTUALIZAR ESPECIFICACIONES DE PRODUCTO =====")
+    
+    product_id_input = input("\nIngresa ID de Producto VTEX (o IDs separados por coma): ")
+    product_ids = [pid.strip() for pid in product_id_input.split(',') if pid.strip()]
+    
+    if not product_ids:
+        print("No se ingresaron IDs. Volviendo al menú...")
+        time.sleep(1.5)
+        return
+
+    for i, product_id in enumerate(product_ids):
+        if not product_id.isdigit():
+            print(f"Omitiendo ID de Producto inválido: '{product_id}'")
+            continue
+        
+        print(f"\n--- Procesando ID de Producto: {product_id} ({i+1}/{len(product_ids)}) ---")
+        if i > 0: time.sleep(1.5)
+
+        product_data = get_product_data(product_id)
+        if not product_data: continue
+        
+        category_id = product_data.get("CategoryId")
+        if not category_id:
+            print(f"Producto {product_id} ('{product_data.get('Name', 'N/A')}') no tiene CategoryId. Omitiendo.")
+            continue
+
+        print(f"\nNombre del Producto: {product_data.get('Name', 'N/A')}")
+        cleaned_desc = clean_html(product_data.get("Description", ""))
+        print(f"Categoría ID: {category_id}")
+
+        category_fields_vtex = get_category_fields(category_id)
+        if category_fields_vtex is None:
+             print(f"Fallo crítico al obtener campos de categoría para CatID {category_id}. Omitiendo producto {product_id}.")
+             continue
+        if not category_fields_vtex:
+             print(f"No se encontraron campos de especificación para la categoría {category_id}.")
+        else:
+            print(f"Se encontraron {len(category_fields_vtex)} campos de especificación para la categoría {category_id}.")
+            print("  Campos de VTEX disponibles para esta categoría (para verificar nombres):")
+            for f_vtex in category_fields_vtex: print(f"    - '{f_vtex.get('Name')}' (FieldId: {f_vtex.get('FieldId')})")
+
+        print("\nProcesando con Gemini...")
+        standardized_data = process_with_gemini(product_data.get("Name", "N/A"), cleaned_desc, category_fields_vtex)
+
+        if standardized_data is None: print(f"Procesamiento de Gemini falló para {product_id}."); continue
+        if not standardized_data: print(f"Gemini no extrajo ninguna especificación para {product_id}."); continue
+        
+        print("\nDatos Estandarizados de Gemini:"); [print(f"  '{k}': '{v}'") for k, v in standardized_data.items()]
+        
+        confirm_update = input(f"\n¿Quieres actualizar estas especificaciones en VTEX para el producto {product_id} (usando PUT individual por campo)? (s/n): ").strip().lower()
+        if confirm_update == 's':
+            success_overall = update_product_specs_via_put(product_id, standardized_data, category_fields_vtex)
+            print(f"Resultado general de la actualización para producto {product_id}: {'Todos los campos OK' if success_overall else 'Algunos campos fallaron'}")
+        else:
+            print(f"Omitiendo actualización en VTEX para el producto {product_id}.")
+        print(f"--- Finalizado ID de Producto: {product_id} ---")
+    
+    input("\nPresione Enter para continuar...")
+
+def manage_products():
+    """Gestiona las opciones relacionadas con productos"""
+    options = {
+        "1": "Crear nuevo producto",
+        "2": "Buscar producto por ID",
+        "3": "Buscar producto por RefID",
+        "0": "Volver al menú principal"
+    }
+    
+    while True:
+        choice = show_menu("GESTIÓN DE PRODUCTOS", options)
+        
+        if choice == "1":
+            create_new_product()
+        elif choice == "2":
+            search_product_by_id()
+        elif choice == "3":
+            search_product_by_refid()
+        elif choice == "0":
+            break
+        else:
+            print("\nOpción no válida. Intente de nuevo.")
+            time.sleep(1)
+
+def create_new_product():
+    """Crea un nuevo producto en VTEX"""
+    clear_screen()
+    print("\n===== CREAR NUEVO PRODUCTO =====")
+    
+    # Solicitar información básica del producto
+    ref_id = input("\nIngrese RefID del producto: ").strip()
+    if not ref_id:
+        print("RefID es obligatorio. Volviendo al menú...")
+        time.sleep(1.5)
+        return
+    
+    # Verificar si ya existe un producto con ese RefID
+    existing_product = get_product_by_ref_id(ref_id)
+    if existing_product:
+        print(f"\n⚠️ Ya existe un producto con RefID '{ref_id}':")
+        print(f"  ID: {existing_product.get('Id')}")
+        print(f"  Nombre: {existing_product.get('Name')}")
+        print(f"  Categoría: {existing_product.get('CategoryId')}")
+        print(f"  Marca: {existing_product.get('BrandId')}")
+        
+        confirm = input("\n¿Desea continuar y crear otro producto con el mismo RefID? (s/n): ").strip().lower()
+        if confirm != 's':
+            print("Operación cancelada. Volviendo al menú...")
+            time.sleep(1.5)
+            return
+    
+    title = input("Ingrese título del producto: ").strip()
+    if not title:
+        print("Título es obligatorio. Volviendo al menú...")
+        time.sleep(1.5)
+        return
+    
+    # Obtener listas de marcas y categorías
+    print("\nObteniendo datos necesarios...")
+    brands_list = get_brand_list()
+    categories_tree = get_category_tree()
+    
+    if not brands_list or not categories_tree:
+        print("No se pudieron obtener marcas o categorías. Volviendo al menú...")
+        time.sleep(1.5)
+        return
+    
+    # Analizar con Gemini para sugerir marca y categoría
+    analysis = analyze_product_info_with_gemini(ref_id, title, brands_list, categories_tree)
+    
+    if not analysis:
+        print("No se pudo analizar el producto. Volviendo al menú...")
+        time.sleep(1.5)
+        return
+    
+    # Mostrar resultados del análisis
+    print("\n===== ANÁLISIS DEL PRODUCTO =====")
+    
+    # Información de marca
+    brand_info = analysis.get('brand', {})
+    brand_id = brand_info.get('id')
+    brand_name = brand_info.get('name')
+    brand_confidence = brand_info.get('confidence', 0)
+    create_new_brand = brand_info.get('create_new', False)
+    
+    print(f"\nMarca sugerida: {brand_name} (ID: {brand_id if brand_id else 'Nueva'})")
+    print(f"Confianza: {brand_confidence*100:.1f}%")
+    
+    # Información de categoría
+    category_info = analysis.get('category', {})
+    category_id = category_info.get('id')
+    category_name = category_info.get('name')
+    category_confidence = category_info.get('confidence', 0)
+    
+    print(f"\nCategoría sugerida: {category_name} (ID: {category_id})")
+    print(f"Confianza: {category_confidence*100:.1f}%")
+    
+    # Confirmar o modificar marca
+    if create_new_brand or not brand_id:
+        print("\n⚠️ La marca no existe en el sistema.")
+        create_brand_confirm = input("¿Desea crear la marca? (s/n): ").strip().lower()
+        
+        if create_brand_confirm == 's':
+            brand_data = {
+                "Name": brand_name,
+                "Text": f"Marca: {brand_name}",
+                "Keywords": brand_name,
+                "SiteTitle": brand_name,
+                "Active": True
+            }
+            
+            success, response = create_brand(brand_data)
+            
+            if success and response:
+                brand_id = response.get('Id')
+                print(f"✅ Marca creada con ID: {brand_id}")
+            else:
+                print("❌ No se pudo crear la marca. Volviendo al menú...")
+                time.sleep(1.5)
+                return
+        else:
+            # Permitir seleccionar una marca existente
+            print("\nMarcas disponibles:")
+            for i, brand in enumerate(brands_list[:10]):
+                print(f"{i+1}. {brand.get('Name')} (ID: {brand.get('Id')})")
+            
+            brand_choice = input("\nSeleccione una marca (número) o ingrese un ID directamente: ").strip()
+            
+            if brand_choice.isdigit() and 1 <= int(brand_choice) <= len(brands_list[:10]):
+                brand_id = brands_list[int(brand_choice)-1].get('Id')
+            elif brand_choice.isdigit():
+                brand_id = int(brand_choice)
+            else:
+                print("Selección no válida. Volviendo al menú...")
+                time.sleep(1.5)
+                return
+    
+    # Confirmar o modificar categoría
+    if not category_id:
+        print("\n⚠️ No se pudo identificar una categoría adecuada.")
+        # Permitir seleccionar una categoría
+        print("\nAlgunas categorías disponibles:")
+        
+        # Mostrar algunas categorías de primer nivel
+        top_categories = categories_tree[:10]
+        for i, cat in enumerate(top_categories):
+            print(f"{i+1}. {cat.get('name')} (ID: {cat.get('id')})")
+        
+        cat_choice = input("\nSeleccione una categoría (número) o ingrese un ID directamente: ").strip()
+        
+        if cat_choice.isdigit() and 1 <= int(cat_choice) <= len(top_categories):
+            category_id = top_categories[int(cat_choice)-1].get('id')
+        elif cat_choice.isdigit():
+            category_id = int(cat_choice)
+        else:
+            print("Selección no válida. Volviendo al menú...")
+            time.sleep(1.5)
+            return
+    
+    # Solicitar descripción o dejarla vacía
+    print("\nLa descripción puede dejarse vacía y completarse después.")
+    description = input("Ingrese descripción (opcional, presione Enter para dejar vacía): ").strip()
+    
+    # Crear el producto
+    product_data = {
+        "Name": title,
+        "Title": title,
+        "Description": description,
+        "RefId": ref_id,
+        "CategoryId": category_id,
+        "BrandId": brand_id,
+        "IsActive": False,
+        "IsVisible": False,
+        "ShowWithoutStock": True
+    }
+    
+    # Confirmar creación
+    print("\n===== DATOS DEL PRODUCTO A CREAR =====")
+    print(f"Nombre: {title}")
+    print(f"RefID: {ref_id}")
+    print(f"Categoría: {category_name} (ID: {category_id})")
+    print(f"Marca: {brand_name} (ID: {brand_id})")
+    print(f"Descripción: {'Definida' if description else 'No definida'}")
+    
+    confirm = input("\n¿Desea crear este producto en VTEX? (s/n): ").strip().lower()
+    if confirm != 's':
+        print("Operación cancelada. Volviendo al menú...")
+        time.sleep(1.5)
+        return
+    
+    # Crear el producto
+    success, response = create_product(product_data)
+    
+    if success and response:
+        product_id = response.get('Id')
+        print(f"\n🎉 ¡PRODUCTO CREADO EXITOSAMENTE!")
+        print(f"ID del producto: {product_id}")
+        print(f"Nombre: {response.get('Name')}")
+        print(f"\nRecuerde que el producto se ha creado como INACTIVO.")
+        print(f"Puede activarlo después de completar todas sus especificaciones y SKUs.")
+    else:
+        print("\n❌ No se pudo crear el producto.")
+    
+    input("\nPresione Enter para continuar...")
+
+def search_product_by_id():
+    """Busca un producto por su ID"""
+    clear_screen()
+    print("\n===== BUSCAR PRODUCTO POR ID =====")
+    
+    product_id = input("\nIngrese ID del producto: ").strip()
+    if not product_id or not product_id.isdigit():
+        print("ID de producto no válido. Volviendo al menú...")
+        time.sleep(1.5)
+        return
+    
+    product_data = get_product_data(product_id)
+    
+    if not product_data:
+        print(f"\n❌ No se encontró producto con ID: {product_id}")
+        input("\nPresione Enter para continuar...")
+        return
+    
+    print(f"\n✅ Producto encontrado:")
+    print(f"Nombre: {product_data.get('Name', 'N/A')}")
+    print(f"Categoría: {product_data.get('CategoryId', 'N/A')}")
+    print(f"Descripción: {'Definida' if product_data.get('Description') else 'No definida'}")
+    
+    input("\nPresione Enter para continuar...")
+
+def search_product_by_refid():
+    """Busca un producto por su RefID"""
+    clear_screen()
+    print("\n===== BUSCAR PRODUCTO POR REFID =====")
+    
+    ref_id = input("\nIngrese RefID del producto: ").strip()
+    if not ref_id:
+        print("RefID no válido. Volviendo al menú...")
+        time.sleep(1.5)
+        return
+    
+    product_data = get_product_by_ref_id(ref_id)
+    
+    if not product_data:
+        print(f"\n❌ No se encontró producto con RefID: {ref_id}")
+        input("\nPresione Enter para continuar...")
+        return
+    
+    print(f"\n✅ Producto encontrado:")
+    print(f"ID: {product_data.get('Id', 'N/A')}")
+    print(f"Nombre: {product_data.get('Name', 'N/A')}")
+    print(f"Categoría: {product_data.get('CategoryId', 'N/A')}")
+    print(f"Marca: {product_data.get('BrandId', 'N/A')}")
+    print(f"Descripción: {'Definida' if product_data.get('Description') else 'No definida'}")
+    
+    input("\nPresione Enter para continuar...")
+
+def get_sku_data(sku_id):
+    """Obtiene información del SKU desde la API de VTEX"""
+    url = f"{BASE_URL}/api/catalog_system/pvt/sku/stockkeepingunitbyid/{sku_id}"
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+        return data
+    except requests.exceptions.RequestException as e:
+        print(f"Error al obtener datos del SKU {sku_id}: {e}")
+    except json.JSONDecodeError as e:
+        print(f"Error al decodificar JSON del SKU {sku_id}: {e} - Respuesta: {response.text}")
+    return None
+
+def get_sku_images(sku_id):
+    """Obtiene las imágenes del SKU desde la API de stockkeepingunitbyid"""
+    sku_data = get_sku_data(sku_id)
+    if sku_data:
+        images = sku_data.get("Images", [])
+        return images if isinstance(images, list) else []
+    return []
+
+def get_most_specific_category(categories_full_path):
+    """Extrae la categoría más específica del array CategoriesFullPath"""
+    if not categories_full_path or not isinstance(categories_full_path, list):
+        return None
+    
+    # La categoría más específica es la última en el array
+    most_specific = categories_full_path[-1] if categories_full_path else None
+    return most_specific
+
+def get_highest_level_category(categories_full_path):
+    """Extrae la categoría de más alto nivel (raíz) del array CategoriesFullPath"""
+    if not categories_full_path or not isinstance(categories_full_path, list):
+        return None
+    
+    # La categoría de más alto nivel es la primera en el array
+    highest_level = categories_full_path[0] if categories_full_path else None
+    return highest_level
+
+def find_category_descriptive_fields(category_id):
+    """Busca los campos descriptivos específicos en la categoría"""
+    category_fields = get_category_fields(category_id)
+    if not category_fields:
+        return []
+    
+    # Buscar campos específicos que necesitamos
+    target_fields = [
+        "Atributo 1", "Atributo 2", "Atributo 3", "Atributo 4", 
+        "Atributo 5", "Atributo 6", "Atributo 7",
+        "Imagen 1", "Title 1", "Text 1",
+        "Imagen 2", "Title 2", "Text 2", 
+        "Imagen 3", "Title 3", "Text 3"
+    ]
+    
+    found_fields = []
+    for field in category_fields:
+        field_name = field.get('Name', '')
+        if field_name in target_fields:
+            found_fields.append(field)
+    
+    return found_fields
+
+def generate_descriptive_content_with_gemini(product_name, description, sku_images):
+    """Genera contenido descriptivo usando Gemini para atributos y títulos/textos"""
+    
+    # Preparar información de imágenes
+    image_info = ""
+    if sku_images:
+        image_info = "\nImágenes disponibles del producto:\n"
+        for i, img in enumerate(sku_images[:3]):  # Solo las primeras 3 imágenes
+            image_info += f"- Imagen {i+1}: {img.get('ImageName', 'Sin nombre')} - URL: {img.get('ImageUrl', 'N/A')}\n"
+    
+    prompt = f"""
+    Eres un experto en marketing de productos para e-commerce.
+    
+    Producto: {product_name}
+    Descripción: {description}
+    {image_info}
+    
+    Tu tarea es generar contenido descriptivo estructurado para este producto.
+    
+    Necesito que generes:
+    
+    1. ATRIBUTOS (7 atributos clave del producto):
+    - Atributo 1: Una característica técnica principal
+    - Atributo 2: Una característica de diseño o material
+    - Atributo 3: Una característica de funcionalidad
+    - Atributo 4: Una característica de compatibilidad o uso
+    - Atributo 5: Una característica de calidad o durabilidad
+    - Atributo 6: Una característica adicional relevante
+    - Atributo 7: Una característica de valor agregado
+    
+    2. TÍTULOS Y TEXTOS DESCRIPTIVOS (3 características principales):
+    - Title 1: Título de la característica más importante
+    - Text 1: Descripción detallada de esa característica (2-3 líneas)
+    - Title 2: Título de la segunda característica más importante  
+    - Text 2: Descripción detallada de esa característica (2-3 líneas)
+    - Title 3: Título de la tercera característica más importante
+    - Text 3: Descripción detallada de esa característica (2-3 líneas)
+    
+    3. IMÁGENES (URLs de las imágenes disponibles):
+    - Imagen 1: URL de la imagen principal
+    - Imagen 2: URL de la segunda imagen
+    - Imagen 3: URL de la tercera imagen
+    
+    INSTRUCCIONES:
+    - Los atributos deben ser concisos (máximo 50 caracteres cada uno)
+    - Los títulos deben ser atractivos y descriptivos (máximo 60 caracteres)
+    - Los textos deben ser informativos y persuasivos
+    - Si hay menos de 3 imágenes disponibles, usa las que tengas
+    - Todos los textos deben estar en español
+    - Basa el contenido en la información del producto proporcionada
+    
+    Devuelve ÚNICAMENTE un objeto JSON con el siguiente formato exacto:
+    {{
+        "Atributo 1": "valor del atributo 1",
+        "Atributo 2": "valor del atributo 2",
+        "Atributo 3": "valor del atributo 3",
+        "Atributo 4": "valor del atributo 4",
+        "Atributo 5": "valor del atributo 5",
+        "Atributo 6": "valor del atributo 6",
+        "Atributo 7": "valor del atributo 7",
+        "Title 1": "título de característica 1",
+        "Text 1": "descripción detallada de característica 1",
+        "Title 2": "título de característica 2", 
+        "Text 2": "descripción detallada de característica 2",
+        "Title 3": "título de característica 3",
+        "Text 3": "descripción detallada de característica 3",
+        "Imagen 1": "URL de imagen 1",
+        "Imagen 2": "URL de imagen 2", 
+        "Imagen 3": "URL de imagen 3"
+    }}
+    """
+    
+    try:
+        response = model.generate_content(prompt)
+        raw_text = response.text.strip()
+        try:
+            return json.loads(raw_text)
+        except json.JSONDecodeError:
+            match = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", raw_text, re.DOTALL) or \
+                    re.search(r"(\{[\s\S]*?\})", raw_text, re.DOTALL)
+            if match: return json.loads(match.group(1))
+            print(f"No se pudo extraer JSON de la respuesta de Gemini: {raw_text}")
+    except Exception as e:
+        print(f"Error con la API de Gemini o procesamiento: {e}")
+    return None
+
+def update_descriptive_attributes():
+    """Actualiza atributos descriptivos y títulos usando datos del SKU API"""
+    clear_screen()
+    print("\n===== ACTUALIZAR ATRIBUTOS DESCRIPTIVOS =====")
+    
+    product_id_input = input("\nIngresa ID de Producto VTEX (o IDs separados por coma): ")
+    product_ids = [pid.strip() for pid in product_id_input.split(',') if pid.strip()]
+    
+    if not product_ids:
+        print("No se ingresaron IDs. Volviendo al menú...")
+        time.sleep(1.5)
+        return
+
+    for i, product_id in enumerate(product_ids):
+        if not product_id.isdigit():
+            print(f"Omitiendo ID de Producto inválido: '{product_id}'")
+            continue
+        
+        print(f"\n--- Procesando ID de Producto: {product_id} ({i+1}/{len(product_ids)}) ---")
+        if i > 0: time.sleep(1.5)
+
+        # Obtener datos básicos del producto
+        product_data = get_product_data(product_id)
+        if not product_data:
+            print(f"No se pudo obtener información del producto {product_id}")
+            continue
+        
+        product_name = product_data.get("Name", "N/A")
+        description = clean_html(product_data.get("Description", ""))
+        
+        print(f"\nNombre del Producto: {product_name}")
+
+        # Solicitar SKU ID
+        sku_id_input = input("\nIngresa ID de SKU VTEX: ").strip()
+        if not sku_id_input or not sku_id_input.isdigit():
+            print("ID de SKU no válido. Omitiendo producto...")
+            continue
+
+        sku_id = int(sku_id_input)
+
+        # Obtener datos del SKU
+        sku_data = get_sku_data(sku_id)
+        if not sku_data:
+            print(f"No se pudo obtener información del SKU {sku_id}")
+            continue
+
+        # Obtener CategoriesFullPath
+        categories_full_path = sku_data.get("CategoriesFullPath")
+        if not categories_full_path:
+            print(f"SKU {sku_id} no tiene CategoriesFullPath")
+            continue
+
+        print(f"Categorías encontradas: {categories_full_path}")
+
+        # Iterar a través de las categorías de más específica a más general
+        descriptive_fields = []
+        for category_path in reversed(categories_full_path):
+            # Extraer el ID de la categoría del path
+            category_parts = category_path.strip('/').split('/')
+            category_id = None
+            category_name = "N/A"
+            if category_parts:
+                # El último elemento no vacío debe ser el ID de categoría
+                for part in reversed(category_parts):
+                    if part.strip():
+                        category_name = part.strip()
+                        if part.strip().isdigit():
+                            category_id = int(part.strip())
+                        break
+                
+                # Si no encontramos un ID numérico, usamos el del producto como fallback
+                if not category_id:
+                    category_id = product_data.get("CategoryId")
+                
+                print(f"Buscando campos en categoría: {category_name} (ID: {category_id if category_id else 'N/A'})")
+                
+                # Buscar campos descriptivos en la categoría
+                if category_id:
+                    descriptive_fields = find_category_descriptive_fields(category_id)
+                    if descriptive_fields:
+                        print(f"Se encontraron campos descriptivos en la categoría {category_name} (ID: {category_id})")
+                        break
+                    else:
+                        print(f"No se encontraron campos descriptivos en la categoría {category_name} (ID: {category_id})")
+                else:
+                    print(f"No se pudo determinar un ID de categoría válido para {category_name}")
+        
+        if not descriptive_fields:
+            print(f"No se encontraron campos descriptivos en ninguna categoría de la jerarquía")
+            print("Campos disponibles en la última categoría intentada:")
+            fallback_category_id = product_data.get("CategoryId", 0)
+            all_fields = get_category_fields(fallback_category_id)
+            for field in all_fields[:10]:  # Mostrar solo los primeros 10
+                print(f"  - {field.get('Name')}")
+            continue
+        
+        print(f"Se encontraron {len(descriptive_fields)} campos descriptivos:")
+        for field in descriptive_fields:
+            print(f"  - {field.get('Name')} (FieldId: {field.get('FieldId')})")
+        
+        # Obtener imágenes del SKU
+        sku_images = get_sku_images(sku_id)
+        print(f"Se encontraron {len(sku_images)} imágenes del SKU")
+        
+        # Generar contenido descriptivo con Gemini
+        print("\nGenerando contenido descriptivo con Gemini...")
+        descriptive_content = generate_descriptive_content_with_gemini(product_name, description, sku_images)
+        
+        if not descriptive_content:
+            print(f"No se pudo generar contenido descriptivo para el producto {product_id}")
+            continue
+        
+        print("\nContenido generado por Gemini:")
+        for key, value in descriptive_content.items():
+            print(f"  '{key}': '{value}'")
+        
+        # Filtrar solo los campos que existen en la categoría
+        filtered_content = {}
+        for field in descriptive_fields:
+            field_name = field.get('Name')
+            if field_name in descriptive_content:
+                filtered_content[field_name] = descriptive_content[field_name]
+        
+        if not filtered_content:
+            print("No hay contenido que coincida con los campos de la categoría")
+            continue
+        
+        print(f"\nContenido filtrado para actualizar ({len(filtered_content)} campos):")
+        for key, value in filtered_content.items():
+            print(f"  '{key}': '{value}'")
+        
+        # Confirmar actualización
+        confirm_update = input(f"\n¿Quieres actualizar estos campos descriptivos en VTEX para el producto {product_id}? (s/n): ").strip().lower()
+        if confirm_update == 's':
+            success_overall = update_product_specs_via_put(product_id, filtered_content, descriptive_fields)
+            print(f"Resultado general de la actualización para producto {product_id}: {'Todos los campos OK' if success_overall else 'Algunos campos fallaron'}")
+        else:
+            print(f"Omitiendo actualización en VTEX para el producto {product_id}.")
+        
+        print(f"--- Finalizado ID de Producto: {product_id} ---")
+    
+    input("\nPresione Enter para continuar...")
+
+def manage_descriptions():
+    """Gestiona las opciones relacionadas con descripciones"""
+    options = {
+        "1": "Actualizar descripción de producto",
+        "2": "Generar descripción con IA (a partir de texto pegado)",
+        "0": "Volver al menú principal"
+    }
+    
+    while True:
+        choice = show_menu("GESTIÓN DE DESCRIPCIONES", options)
+        
+        if choice == "1":
+            update_product_description_menu()
+        elif choice == "2":
+            generate_description_menu()
+        elif choice == "0":
+            break
+        else:
+            print("\nOpción no válida. Intente de nuevo.")
+            time.sleep(1)
+
+def update_product_description_menu():
+    """Menú para actualizar la descripción de un producto"""
+    clear_screen()
+    print("\n===== ACTUALIZAR DESCRIPCIÓN DE PRODUCTO =====")
+    
+    product_id = input("\nIngrese ID del producto: ").strip()
+    if not product_id or not product_id.isdigit():
+        print("ID de producto no válido. Volviendo al menú...")
+        time.sleep(1.5)
+        return
+    
+    product_data = get_product_data(product_id)
+    
+    if not product_data:
+        print(f"\n❌ No se encontró producto con ID: {product_id}")
+        input("\nPresione Enter para continuar...")
+        return
+    
+    print(f"\nProducto: {product_data.get('Name', 'N/A')}")
+    
+    current_description = product_data.get('Description', '')
+    if current_description:
+        print(f"\nDescripción actual:")
+        print(f"{current_description[:500]}...")
+        if len(current_description) > 500:
+            print("(Descripción truncada por longitud)")
+    else:
+        print("\nEl producto no tiene descripción actualmente.")
+    
+    print("\nIngrese la nueva descripción (puede usar HTML básico):")
+    print("(Presione Enter dos veces para finalizar)")
+    
+    lines = []
+    while True:
+        line = input()
+        if line == "" and (not lines or lines[-1] == ""):
+            break
+        lines.append(line)
+    
+    new_description = "\n".join(lines)
+    
+    if not new_description:
+        print("\nNo se ingresó descripción. Operación cancelada.")
+        input("\nPresione Enter para continuar...")
+        return
+    
+    print(f"\n¿Confirma actualizar la descripción del producto {product_id}? (s/n): ")
+    confirm = input().strip().lower()
+    
+    if confirm == 's':
+        success, response = update_product_description(product_id, new_description)
+        
+        if success:
+            print(f"\n🎉 ✅ Descripción actualizada exitosamente!")
+        else:
+            print(f"\n❌ Error al actualizar la descripción.")
+    else:
+        print("\nOperación cancelada.")
+    
+    input("\nPresione Enter para continuar...")
+
+def generate_description_menu():
+    """Menú para generar una descripción con IA"""
+    clear_screen()
+    print("\n===== GENERAR DESCRIPCIÓN CON IA =====")
+    
+    product_id = input("\nIngrese ID del producto (opcional, solo para actualizar directamente): ").strip()
+    
+    if product_id and product_id.isdigit():
+        product_data = get_product_data(product_id)
+        if not product_data:
+            print(f"\n❌ No se encontró producto con ID: {product_id}")
+            product_name = input("\nIngrese nombre del producto para la descripción: ").strip()
+        else:
+            product_name = product_data.get('Name', '')
+            print(f"\nProducto: {product_name}")
+    else:
+        product_id = ""
+        product_name = input("\nIngrese nombre del producto para la descripción: ").strip()
+    
+    if not product_name:
+        print("\nNombre de producto no válido. Volviendo al menú...")
+        time.sleep(1.5)
+        return
+    
+    print("\nPegue el texto fuente de la descripción (de la página oficial u otra fuente):")
+    print("(Presione Enter dos veces para finalizar)")
+    
+    lines = []
+    while True:
+        line = input()
+        if line == "" and (not lines or lines[-1] == ""):
+            break
+        lines.append(line)
+    
+    source_text = "\n".join(lines)
+    
+    if not source_text:
+        print("\nNo se ingresó texto fuente. Operación cancelada.")
+        input("\nPresione Enter para continuar...")
+        return
+    
+    print(f"\n🧠 Generando descripción con IA para '{product_name}'...")
+    description_html = generate_description_with_gemini(product_name, source_text)
+    
+    if not description_html:
+        print("\n❌ Error al generar la descripción.")
+        input("\nPresione Enter para continuar...")
+        return
+    
+    print(f"\n✅ Descripción generada:")
+    print(f"\n{description_html}")
+    
+    if product_id:
+        print(f"\n¿Desea actualizar el producto {product_id} con esta descripción? (s/n): ")
+        confirm = input().strip().lower()
+        
+        if confirm == 's':
+            success, response = update_product_description(product_id, description_html)
+            
+            if success:
+                print(f"\n🎉 ✅ Descripción actualizada exitosamente!")
+            else:
+                print(f"\n❌ Error al actualizar la descripción.")
+    else:
+        print("\nPuede copiar esta descripción y usarla para actualizar un producto.")
+    
+    input("\nPresione Enter para continuar...")
+
+def manage_attributes():
+    """Gestiona las opciones relacionadas con atributos descriptivos"""
+    options = {
+        "1": "Actualizar atributos/títulos descriptivos",
+        "0": "Volver al menú principal"
+    }
+    
+    while True:
+        choice = show_menu("GESTIÓN DE ATRIBUTOS/TÍTULOS DESCRIPTIVOS", options)
+        
+        if choice == "1":
+            update_descriptive_attributes()
+        elif choice == "0":
+            break
+        else:
+            print("\nOpción no válida. Intente de nuevo.")
+            time.sleep(1)
+
+def main():
+    """Función principal con menú de opciones"""
+    options = {
+        "1": "Gestionar Especificaciones",
+        "2": "Gestionar Productos",
+        "3": "Gestionar Descripciones",
+        "4": "Gestionar atributos/títulos descriptivos",
+        "0": "Salir"
+    }
+    
+    while True:
+        choice = show_menu("VTEX CATALOGATOR", options)
+        
+        if choice == "1":
+            manage_specifications()
+        elif choice == "2":
+            manage_products()
+        elif choice == "3":
+            manage_descriptions()
+        elif choice == "4":
+            manage_attributes()
+        elif choice == "0":
+            print("\n¡Gracias por usar VTEX CATALOGATOR!")
+            break
+        else:
+            print("\nOpción no válida. Intente de nuevo.")
+            time.sleep(1)
+
+if __name__ == "__main__":
+    main()
